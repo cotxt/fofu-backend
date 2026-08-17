@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fofu-backend"
+version = "0.1.0"
+description = "Shared FastAPI backend for the Fofu iOS, Android, and install-free web clients"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "alembic>=1.16,<2",
+  "cachecontrol>=0.14,<1",
+  "email-validator>=2.2,<3",
+  "fastapi>=0.116,<1",
+  "google-auth[requests]>=2.40,<3",
+  "httpx[http2]>=0.28,<1",
+  "pydantic-settings>=2.10,<3",
+  "pwdlib[argon2]>=0.2,<1",
+  "PyJWT[crypto]>=2.10,<3",
+  "python-multipart>=0.0.20,<1",
+  "qrcode>=8.2,<9",
+  "SQLAlchemy>=2.0.41,<3",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.2,<4"]
+test = [
+  "httpx>=0.28,<1",
+  "pytest>=8.4,<9",
+  "pytest-cov>=6.2,<7",
+  "ruff>=0.12,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["B008"]

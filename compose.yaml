@@ -1,0 +1,56 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: fofu
+      POSTGRES_USER: fofu
+      POSTGRES_PASSWORD: local-fofu-password
+    volumes:
+      - fofu-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fofu -d fofu"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      FOFU_ENVIRONMENT: local
+      FOFU_DATABASE_URL: postgresql+psycopg://fofu:local-fofu-password@db:5432/fofu
+      FOFU_JWT_SECRET: local-compose-secret-change-before-deploy-123456
+      FOFU_GOOGLE_OAUTH_CLIENT_IDS: '${FOFU_GOOGLE_OAUTH_CLIENT_IDS:-[]}'
+      FOFU_APNS_ENABLED: '${FOFU_APNS_ENABLED:-false}'
+      FOFU_APNS_ENVIRONMENT: '${FOFU_APNS_ENVIRONMENT:-sandbox}'
+      FOFU_APNS_TEAM_ID: '${FOFU_APNS_TEAM_ID:-}'
+      FOFU_APNS_KEY_ID: '${FOFU_APNS_KEY_ID:-}'
+      FOFU_APNS_BUNDLE_ID: '${FOFU_APNS_BUNDLE_ID:-}'
+      FOFU_APNS_PRIVATE_KEY_PATH: '${FOFU_APNS_PRIVATE_KEY_PATH:-}'
+      FOFU_PUSH_WORKER_POLL_SECONDS: '${FOFU_PUSH_WORKER_POLL_SECONDS:-2}'
+      FOFU_PUSH_WORKER_BATCH_SIZE: '${FOFU_PUSH_WORKER_BATCH_SIZE:-20}'
+      FOFU_PUSH_DELIVERY_MAX_ATTEMPTS: '${FOFU_PUSH_DELIVERY_MAX_ATTEMPTS:-8}'
+      FOFU_PUSH_DELIVERY_LEASE_SECONDS: '${FOFU_PUSH_DELIVERY_LEASE_SECONDS:-60}'
+      FOFU_PUSH_DELIVERY_RETENTION_DAYS: '${FOFU_PUSH_DELIVERY_RETENTION_DAYS:-30}'
+      FOFU_PUSH_MAX_ACTIVE_DEVICES_PER_USER: '${FOFU_PUSH_MAX_ACTIVE_DEVICES_PER_USER:-10}'
+      FOFU_CORS_ORIGINS: '["http://localhost:3000"]'
+      FOFU_WEB_APP_BASE_URL: http://localhost:3000
+      FOFU_PUBLIC_API_BASE_URL: http://localhost:8000
+      FOFU_AUTO_CREATE_SCHEMA: "false"
+      FOFU_SEED_DEMO_DATA: "true"
+    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - fofu-uploads:/app/var/uploads
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready')"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  fofu-postgres:
+  fofu-uploads:

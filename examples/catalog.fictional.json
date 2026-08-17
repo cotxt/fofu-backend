@@ -1,0 +1,140 @@
+{
+  "schema_version": 1,
+  "ingredients": [
+    {
+      "code": "fictional-rice",
+      "name_en": "Fictional test rice",
+      "name_ko": "가상 테스트 쌀",
+      "emoji": "🍚"
+    },
+    {
+      "code": "fictional-tofu",
+      "name_en": "Fictional test tofu",
+      "name_ko": "가상 테스트 두부"
+    }
+  ],
+  "allergens": [
+    {
+      "code": "fictional-soy",
+      "name_en": "Fictional soy allergen",
+      "name_ko": "가상 대두 알레르겐"
+    }
+  ],
+  "restaurants": [
+    {
+      "slug": "fofu-fictional-test-kitchen",
+      "name_en": "Fofu Fictional Test Kitchen",
+      "name_ko": "Fofu 가상 테스트 주방",
+      "description_en": "A fictional venue used only to demonstrate the Fofu catalog importer.",
+      "description_ko": "Fofu 카탈로그 가져오기 예시만을 위한 가상 식당입니다.",
+      "handle": "@fofu.fictional.test",
+      "category": "Fictional Korean",
+      "hero_style": "garden",
+      "address_en": "1 Fictional QA-ro, Test-gu, Seoul (not a real address)",
+      "address_ko": "서울 테스트구 가상 QA로 1 (실제 주소 아님)",
+      "latitude": 37.5561,
+      "longitude": 126.9237,
+      "currency": "KRW",
+      "timezone_name": "Asia/Seoul",
+      "is_verified": false,
+      "is_open": true,
+      "is_published": false,
+      "translations": [
+        {
+          "locale": "fr",
+          "name": "Cuisine de test fictive Fofu",
+          "description": "Un établissement fictif réservé aux tests.",
+          "address": "1 Fictional QA-ro, Test-gu, Séoul (adresse fictive)"
+        }
+      ],
+      "hours": [
+        {
+          "day_of_week": 0,
+          "opens_at": "11:00:00",
+          "closes_at": "21:00:00",
+          "is_closed": false
+        },
+        {
+          "day_of_week": 1,
+          "is_closed": true
+        }
+      ],
+      "menu_categories": [
+        {
+          "slug": "fictional-bowls",
+          "name_en": "Fictional bowls",
+          "name_ko": "가상 덮밥",
+          "sort_order": 0,
+          "is_active": true,
+          "translations": [
+            {
+              "locale": "fr",
+              "name": "Bols fictifs"
+            }
+          ],
+          "items": [
+            {
+              "slug": "fictional-tofu-rice-bowl",
+              "name_en": "Fictional Tofu Rice Bowl",
+              "name_ko": "가상 두부 덮밥",
+              "pronunciation": "du-bu-deop-bap",
+              "description_en": "A fictional menu item for importer testing only.",
+              "description_ko": "가져오기 테스트만을 위한 가상 메뉴입니다.",
+              "price_amount": 12000,
+              "currency": "KRW",
+              "serving_description": "One fictional bowl",
+              "spice_level": 1,
+              "taste_profile": {
+                "savory": 0.7,
+                "light": 0.5
+              },
+              "local_tips": [
+                {
+                  "title": "QA only",
+                  "body": "Do not treat this fictional dish as real restaurant data."
+                }
+              ],
+              "badge": "fictional-fixture",
+              "is_available": true,
+              "sort_order": 0,
+              "translations": [
+                {
+                  "locale": "fr",
+                  "name": "Bol fictif au tofu et riz",
+                  "description": "Plat fictif réservé aux tests.",
+                  "pronunciation": "du-bu-deop-bap"
+                }
+              ],
+              "ingredients": [
+                {
+                  "code": "fictional-rice",
+                  "is_primary": true,
+                  "sort_order": 0
+                },
+                {
+                  "code": "fictional-tofu",
+                  "is_primary": false,
+                  "sort_order": 1
+                }
+              ],
+              "allergens": [
+                {
+                  "code": "fictional-soy",
+                  "relation_type": "contains",
+                  "verification_status": "unverified",
+                  "source": "fictional importer example"
+                }
+              ],
+              "dietary_claims": [
+                {
+                  "code": "vegetarian",
+                  "verification_status": "unverified"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
