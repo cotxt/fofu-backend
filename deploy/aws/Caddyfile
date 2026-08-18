@@ -1,0 +1,24 @@
+{
+	admin off
+	email {$FOFU_TLS_EMAIL}
+}
+
+# This listener is reachable only inside the proxy container. It lets Docker
+# verify Caddy itself without depending on public DNS or certificate issuance.
+http://127.0.0.1:2015 {
+	bind 127.0.0.1
+	respond /health 200
+}
+
+{$FOFU_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+
+	reverse_proxy api:8000
+}

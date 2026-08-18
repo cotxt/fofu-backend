@@ -449,6 +449,11 @@ docker compose down
 Compose는 개발 편의를 위한 고정 DB 비밀번호와 local JWT secret을 사용합니다. 그대로 외부에
 노출하거나 운영 배포에 재사용하지 마십시오.
 
+AWS의 단일 저비용 EC2에서 private RDS와 연결해 운영하는 절차와 별도 production Compose는
+[AWS EC2 production deployment](docs/AWS_EC2_DEPLOYMENT.md)에 있습니다. 운영 구성은 SSM
+SecureString에서 DB URL과 JWT secret을 실행 시점에 주입하며, HTTPS proxy, readiness check,
+재시작 정책과 container log rotation을 포함합니다.
+
 ### 로컬 카탈로그 PostgreSQL
 
 제주·서울·경기 카탈로그만 적재한 격리 PostgreSQL 17은 기본 Homebrew PostgreSQL과 충돌하지
