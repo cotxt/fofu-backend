@@ -9,6 +9,13 @@ readonly COMPOSE_VERSION="5.4.0"
 readonly COMPOSE_SHA256="fc5d1371f1ec7987e703da94ede49af3fbfb240b83f22991a98511de7bc4b93b"
 readonly COMPOSE_URL="https://github.com/docker/compose/releases/download/v${COMPOSE_VERSION}/docker-compose-linux-aarch64"
 readonly COMPOSE_PATH="/usr/local/lib/docker/cli-plugins/docker-compose"
+# Amazon Linux 2023's docker package ships buildx 0.12.1, but Compose build
+# requires buildx 0.17.0+. Install a newer plugin into /usr/local, which takes
+# precedence over the /usr/libexec plugin the docker package provides.
+readonly BUILDX_VERSION="0.36.1"
+readonly BUILDX_SHA256="5d0cafd9d16afe1a0f0d9529885344ace2cc99efdd531b6c783c5455a6001569"
+readonly BUILDX_URL="https://github.com/docker/buildx/releases/download/v${BUILDX_VERSION}/buildx-v${BUILDX_VERSION}.linux-arm64"
+readonly BUILDX_PATH="/usr/local/lib/docker/cli-plugins/docker-buildx"
 readonly REPOSITORY_DIR="/opt/fofu"
 readonly DATA_MOUNT="/var/lib/fofu"
 readonly API_UID="10001"
@@ -75,6 +82,36 @@ install -o root -g root -m 0755 \
 installed_compose_version="$(docker compose version --short)"
 if [[ "${installed_compose_version#v}" != "${COMPOSE_VERSION}" ]]; then
   echo "unexpected Docker Compose version: ${installed_compose_version}" >&2
+  exit 69
+fi
+
+buildx_tmp_dir="$(mktemp -d /tmp/fofu-buildx.XXXXXX)"
+cleanup_buildx() {
+  rm -rf -- "${buildx_tmp_dir}"
+}
+trap 'cleanup; cleanup_buildx' EXIT
+
+curl \
+  --fail \
+  --show-error \
+  --silent \
+  --location \
+  --proto '=https' \
+  --tlsv1.2 \
+  --output "${buildx_tmp_dir}/docker-buildx" \
+  "${BUILDX_URL}"
+printf '%s  %s\n' \
+  "${BUILDX_SHA256}" \
+  "${buildx_tmp_dir}/docker-buildx" \
+  | sha256sum --check --status
+install -d -o root -g root -m 0755 "$(dirname -- "${BUILDX_PATH}")"
+install -o root -g root -m 0755 \
+  "${buildx_tmp_dir}/docker-buildx" \
+  "${BUILDX_PATH}"
+
+installed_buildx_version="$(docker buildx version | awk '{ print $2 }')"
+if [[ "${installed_buildx_version#v}" != "${BUILDX_VERSION}" ]]; then
+  echo "unexpected Docker buildx version: ${installed_buildx_version}" >&2
   exit 69
 fi
 
