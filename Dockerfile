@@ -6,7 +6,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN groupadd --system fofu && useradd --system --gid fofu --home-dir /app fofu
+# Keep the runtime identity stable so the production host can grant the
+# persistent upload directory to this unprivileged user without guessing an
+# image-assigned UID/GID.
+RUN groupadd --gid 10001 fofu \
+    && useradd --uid 10001 --gid fofu --no-create-home \
+        --home-dir /app --shell /usr/sbin/nologin fofu
 
 COPY pyproject.toml README.md ./
 COPY app ./app

@@ -19,7 +19,9 @@ Environment=FOFU_COMPOSE_FILE=/opt/fofu/deploy/aws/compose.production.yaml
 Environment=FOFU_DATABASE_URL_PARAMETER=/fofu/production/database-url
 Environment=FOFU_JWT_SECRET_PARAMETER=/fofu/production/jwt-secret
 ExecStart=/opt/fofu/deploy/aws/compose-with-ssm.sh up --detach --build --remove-orphans --wait --wait-timeout 300
-ExecReload=/opt/fofu/deploy/aws/compose-with-ssm.sh up --detach --build --remove-orphans --wait --wait-timeout 300
+# Force recreation on deploy so changes to the bind-mounted Caddyfile are
+# applied even though Caddy's admin API is intentionally disabled.
+ExecReload=/opt/fofu/deploy/aws/compose-with-ssm.sh up --detach --build --force-recreate --remove-orphans --wait --wait-timeout 300
 ExecStop=/opt/fofu/deploy/aws/compose-with-ssm.sh down --timeout 30
 TimeoutStartSec=20min
 TimeoutStopSec=2min

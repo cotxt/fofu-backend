@@ -1,0 +1,211 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Low-cost single-host Fofu API connected to an existing private RDS instance
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC containing fofu-postgres
+  PublicSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet with an active default route to an internet gateway
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Availability Zone containing PublicSubnetId
+  RdsSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: One security group currently attached to fofu-postgres
+  InstanceProfileName:
+    Type: String
+    Default: fofu-api-ec2-profile
+    AllowedPattern: ^[A-Za-z0-9+=,.@_-]{1,128}$
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+  RootDeviceName:
+    Type: String
+    Default: /dev/xvda
+    AllowedPattern: ^/dev/[A-Za-z0-9]+$
+  DataVolumeSizeGiB:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 16384
+    Description: Retained gp3 capacity for uploads and Caddy state
+  RepositoryCommit:
+    Type: String
+    Description: Exact tested fofu-backend Git commit to deploy
+    AllowedPattern: ^[0-9a-f]{40}$
+
+Resources:
+  ApiDataVolume:
+    Type: AWS::EC2::Volume
+    # Delete a new empty disk if initial stack creation rolls back, but retain
+    # it after a successful deployment so owner media survives stack deletion.
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZone
+      Encrypted: true
+      Size: !Ref DataVolumeSizeGiB
+      VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: fofu-api-data
+        - Key: Project
+          Value: fofu
+        - Key: Environment
+          Value: production
+        - Key: DataRetention
+          Value: retained
+
+  ApiSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Fofu API HTTPS ingress with no SSH access
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: ACME and HTTP to HTTPS redirect
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - Description: Fofu public HTTPS API
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: fofu-api-sg
+        - Key: Project
+          Value: fofu
+        - Key: Environment
+          Value: production
+
+  RdsIngressFromApi:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: PostgreSQL from the Fofu API host only
+      GroupId: !Ref RdsSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !GetAtt ApiSecurityGroup.GroupId
+
+  ApiElasticIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: fofu-api-eip
+        - Key: Project
+          Value: fofu
+        - Key: Environment
+          Value: production
+
+  ApiInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: RdsIngressFromApi
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZone
+      ImageId: !Ref LatestAmiId
+      InstanceType: t4g.micro
+      IamInstanceProfile: !Ref InstanceProfileName
+      InstanceInitiatedShutdownBehavior: stop
+      DisableApiTermination: false
+      Monitoring: false
+      PropagateTagsToVolumeOnCreation: true
+      SourceDestCheck: true
+      CreditSpecification:
+        CPUCredits: standard
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+        InstanceMetadataTags: disabled
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          DeleteOnTermination: true
+          DeviceIndex: "0"
+          GroupSet:
+            - !GetAtt ApiSecurityGroup.GroupId
+          SubnetId: !Ref PublicSubnetId
+      BlockDeviceMappings:
+        - DeviceName: !Ref RootDeviceName
+          Ebs:
+            DeleteOnTermination: true
+            Encrypted: true
+            VolumeSize: 12
+            VolumeType: gp3
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #!/usr/bin/env bash
+            set -Eeuo pipefail
+            exec > >(tee -a /var/log/fofu-bootstrap.log | logger -t fofu-bootstrap -s 2>/dev/console) 2>&1
+            echo "Waiting for the Elastic IP and package repositories"
+            package_network_ready=false
+            for attempt in $(seq 1 60); do
+              if dnf install -y git; then
+                package_network_ready=true
+                break
+              fi
+              if (( attempt < 60 )); then
+                sleep 10
+              fi
+            done
+            if [[ "$package_network_ready" != true ]]; then
+              echo "package repositories were unreachable for 10 minutes" >&2
+              exit 69
+            fi
+            if [[ ! -d /opt/fofu/.git ]]; then
+              git clone --filter=blob:none --no-checkout https://github.com/cotxt/fofu-backend.git /opt/fofu
+            fi
+            git -C /opt/fofu fetch --depth 1 origin ${RepositoryCommit}
+            git -C /opt/fofu checkout -B main ${RepositoryCommit}
+            git -C /opt/fofu branch --set-upstream-to=origin/main main
+            /opt/fofu/deploy/aws/bootstrap-ec2-host.sh '${ApiDataVolume}'
+      Tags:
+        - Key: Name
+          Value: fofu-api
+        - Key: Project
+          Value: fofu
+        - Key: Environment
+          Value: production
+
+  ApiElasticIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt ApiElasticIp.AllocationId
+      InstanceId: !Ref ApiInstance
+
+  ApiDataVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      Device: /dev/sdf
+      InstanceId: !Ref ApiInstance
+      VolumeId: !Ref ApiDataVolume
+
+Outputs:
+  InstanceId:
+    Description: Fofu API EC2 instance
+    Value: !Ref ApiInstance
+  SecurityGroupId:
+    Description: Fofu API security group (TCP 80 and 443 only; no SSH)
+    Value: !GetAtt ApiSecurityGroup.GroupId
+  ElasticIp:
+    Description: Stable public IPv4 address
+    Value: !Ref ApiElasticIp
+  DataVolumeId:
+    Description: Retained encrypted EBS volume for uploads and Caddy state
+    Value: !Ref ApiDataVolume
+  DataMount:
+    Description: Persistent host mount used by the API and Caddy
+    Value: /var/lib/fofu
+  TemporaryHostname:
+    Description: Zero-DNS-cost temporary HTTPS hostname
+    Value: !Sub api.${ApiElasticIp}.sslip.io
+  BootstrapLog:
+    Description: Inspect through Session Manager before activating Fofu
+    Value: sudo tail -n 200 /var/log/fofu-bootstrap.log

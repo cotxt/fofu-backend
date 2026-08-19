@@ -13,15 +13,43 @@ import yaml
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 ROOT = Path(__file__).resolve().parents[1]
+DOCKERFILE_PATH = ROOT / "Dockerfile"
 COMPOSE_PATH = ROOT / "deploy" / "aws" / "compose.production.yaml"
 CADDYFILE_PATH = ROOT / "deploy" / "aws" / "Caddyfile"
 WRAPPER_PATH = ROOT / "deploy" / "aws" / "compose-with-ssm.sh"
 IDENTITY_PREP_PATH = ROOT / "deploy" / "aws" / "prepare-runtime-identity.sh"
+HOST_BOOTSTRAP_PATH = ROOT / "deploy" / "aws" / "bootstrap-ec2-host.sh"
+HOST_CONFIGURE_PATH = ROOT / "deploy" / "aws" / "configure-and-start-host.sh"
+HOST_NETWORK_PATH = ROOT / "deploy" / "aws" / "inspect-api-host-network.sh"
+HOST_STACK_PATH = ROOT / "deploy" / "aws" / "fofu-api-host.yaml"
 UNIT_PATH = ROOT / "deploy" / "aws" / "fofu.service"
 
 
 def load_compose() -> dict[str, Any]:
     return yaml.safe_load(COMPOSE_PATH.read_text())
+
+
+class CloudFormationLoader(yaml.SafeLoader):
+    pass
+
+
+def construct_cloudformation_tag(
+    loader: CloudFormationLoader, suffix: str, node: yaml.Node
+) -> dict[str, Any]:
+    if isinstance(node, yaml.ScalarNode):
+        value: Any = loader.construct_scalar(node)
+    elif isinstance(node, yaml.SequenceNode):
+        value = loader.construct_sequence(node)
+    else:
+        value = loader.construct_mapping(node)
+    return {suffix: value}
+
+
+CloudFormationLoader.add_multi_constructor("!", construct_cloudformation_tag)
+
+
+def load_host_stack() -> dict[str, Any]:
+    return yaml.load(HOST_STACK_PATH.read_text(), Loader=CloudFormationLoader)
 
 
 def test_production_proxy_network_and_trusted_ip_stay_aligned() -> None:
@@ -74,6 +102,126 @@ def test_systemd_retries_a_failed_initial_start() -> None:
 
     assert "Restart=on-failure" in unit
     assert "RestartSec=15s" in unit
+    assert "ExecReload=" in unit
+    assert "--force-recreate" in unit
+
+
+def test_host_stack_is_low_cost_no_ssh_and_rds_scoped() -> None:
+    stack = load_host_stack()
+    resources = stack["Resources"]
+    instance = resources["ApiInstance"]["Properties"]
+    ingress = resources["ApiSecurityGroup"]["Properties"]["SecurityGroupIngress"]
+    rds_ingress = resources["RdsIngressFromApi"]["Properties"]
+
+    assert {(rule["IpProtocol"], rule["FromPort"], rule["ToPort"]) for rule in ingress} == {
+        ("tcp", 80, 80),
+        ("tcp", 443, 443),
+    }
+    assert all(rule["FromPort"] != 22 for rule in ingress)
+    assert rds_ingress["FromPort"] == rds_ingress["ToPort"] == 5432
+    assert rds_ingress["SourceSecurityGroupId"] == {"GetAtt": "ApiSecurityGroup.GroupId"}
+    assert "CidrIp" not in rds_ingress
+
+    assert instance["InstanceType"] == "t4g.micro"
+    assert instance["CreditSpecification"] == {"CPUCredits": "standard"}
+    assert instance["Monitoring"] is False
+    assert instance["IamInstanceProfile"] == {"Ref": "InstanceProfileName"}
+    assert instance["MetadataOptions"] == {
+        "HttpEndpoint": "enabled",
+        "HttpTokens": "required",
+        "HttpPutResponseHopLimit": 1,
+        "InstanceMetadataTags": "disabled",
+    }
+    assert instance["NetworkInterfaces"][0]["AssociatePublicIpAddress"] is False
+    assert instance["NetworkInterfaces"][0]["GroupSet"] == [{"GetAtt": "ApiSecurityGroup.GroupId"}]
+    assert instance["BlockDeviceMappings"][0]["Ebs"] == {
+        "DeleteOnTermination": True,
+        "Encrypted": True,
+        "VolumeSize": 12,
+        "VolumeType": "gp3",
+    }
+
+    data_volume = resources["ApiDataVolume"]
+    data_attachment = resources["ApiDataVolumeAttachment"]["Properties"]
+    assert data_volume["DeletionPolicy"] == "RetainExceptOnCreate"
+    assert data_volume["UpdateReplacePolicy"] == "Retain"
+    assert data_volume["Properties"]["Encrypted"] is True
+    assert data_volume["Properties"]["VolumeType"] == "gp3"
+    assert data_volume["Properties"]["AvailabilityZone"] == {"Ref": "AvailabilityZone"}
+    assert data_attachment["VolumeId"] == {"Ref": "ApiDataVolume"}
+    assert data_attachment["InstanceId"] == {"Ref": "ApiInstance"}
+    assert instance["AvailabilityZone"] == {"Ref": "AvailabilityZone"}
+
+
+def test_host_bootstrap_separates_paid_host_creation_from_activation() -> None:
+    dockerfile = DOCKERFILE_PATH.read_text()
+    compose = load_compose()
+    bootstrap = HOST_BOOTSTRAP_PATH.read_text()
+    configure = HOST_CONFIGURE_PATH.read_text()
+    stack = HOST_STACK_PATH.read_text()
+
+    assert 'readonly COMPOSE_VERSION="5.4.0"' in bootstrap
+    assert 'readonly COMPOSE_SHA256="fc5d1371' in bootstrap
+    assert "sha256sum --check --status" in bootstrap
+    assert "systemctl enable --now docker" in bootstrap
+    assert "systemctl enable --now fofu" not in bootstrap
+    assert "FOFU_DATABASE_URL" not in bootstrap
+    assert "FOFU_JWT_SECRET" not in bootstrap
+    assert "NORMALIZED_DATA_VOLUME_ID" in bootstrap
+    assert "refusing to use the root EBS device" in bootstrap
+    assert "refusing to format a non-empty or partitioned data volume" in bootstrap
+    assert "UUID=${filesystem_uuid} ${DATA_MOUNT} xfs" in bootstrap
+    assert "RequiresMountsFor=${DATA_MOUNT}" in bootstrap
+
+    api = compose["services"]["api"]
+    proxy = compose["services"]["proxy"]
+    assert "--uid 10001" in dockerfile
+    assert "--gid 10001" in dockerfile
+    assert api["user"] == "10001:10001"
+    assert api["volumes"] == ["/var/lib/fofu/uploads:/app/var/uploads:Z"]
+    assert "/var/lib/fofu/caddy-data:/data:Z" in proxy["volumes"]
+    assert "/var/lib/fofu/caddy-config:/config:Z" in proxy["volumes"]
+    assert "volumes" not in compose
+
+    assert "getent ahostsv4" in configure
+    assert "FOFU_CORS_ORIGINS=[]" in configure
+    assert "FOFU_AUTO_CREATE_SCHEMA=false" in configure
+    assert "FOFU_SEED_DEMO_DATA=false" in configure
+    assert "FOFU_APNS_ENABLED=false" in configure
+    assert "systemctl start fofu.service" in configure
+    assert "FOFU_DATABASE_URL=" not in configure
+    assert "FOFU_JWT_SECRET=" not in configure
+    assert '[[ "${ipv4_answers}" == "${public_ip}" ]]' in configure
+    assert '[[ -z "${ipv6_answers}" ]]' in configure
+    assert "refusing to replace it" in configure
+
+    assert "AssociatePublicIpAddress: false" in stack
+    assert "AllowedPattern: ^[0-9a-f]{40}$" in stack
+    assert "git clone --filter=blob:none --no-checkout" in stack
+    assert "git -C /opt/fofu fetch --depth 1 origin ${RepositoryCommit}" in stack
+    assert "package_network_ready=false" in stack
+    assert "for attempt in $(seq 1 60)" in stack
+    assert "bootstrap-ec2-host.sh '${ApiDataVolume}'" in stack
+    assert "configure-and-start-host.sh" not in stack
+
+
+def test_host_network_inspection_is_read_only_and_selects_real_public_routes() -> None:
+    script = HOST_NETWORK_PATH.read_text()
+
+    assert "DestinationCidrBlock==`0.0.0.0/0`" in script
+    assert '[[ "${default_gateway}" == igw-* ]]' in script
+    assert "describe-instance-type-offerings" in script
+    assert '[[ "${subnet_az}" == "${rds_az}" ]]' in script
+    assert "enableDnsSupport" in script
+    assert "enableDnsHostnames" in script
+    assert "AvailabilityZone=${recommended_az}" in script
+    assert "run prepare-runtime-identity.sh apply first" in script
+    assert "run-instances" not in script
+    assert "create-security-group" not in script
+    assert "authorize-security-group-ingress" not in script
+    assert "allocate-address" not in script
+    assert "associate-address" not in script
+    assert "No AWS resources were changed." in script
 
 
 def test_identity_preparation_is_narrow_scoped_and_does_not_disclose_jwt() -> None:

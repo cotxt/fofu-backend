@@ -33,6 +33,9 @@ services:
       - --forwarded-allow-ips=172.30.0.2
     restart: unless-stopped
     init: true
+    # Keep the writable upload directory owned by one stable, unprivileged UID
+    # on the host data volume instead of depending on an image-assigned UID.
+    user: "10001:10001"
     expose:
       - "8000"
     networks:
@@ -40,7 +43,7 @@ services:
         ipv4_address: 172.30.0.3
       api-egress: {}
     volumes:
-      - fofu-uploads:/app/var/uploads
+      - /var/lib/fofu/uploads:/app/var/uploads:Z
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m
@@ -84,8 +87,8 @@ services:
       proxy-egress: {}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
-      - caddy-config:/config
+      - /var/lib/fofu/caddy-data:/data:Z
+      - /var/lib/fofu/caddy-config:/config:Z
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=32m
@@ -109,11 +112,6 @@ services:
       retries: 3
       start_period: 10s
     logging: *default-logging
-
-volumes:
-  fofu-uploads:
-  caddy-data:
-  caddy-config:
 
 networks:
   # Only Caddy and the API join this network. It has no route outside Docker.
