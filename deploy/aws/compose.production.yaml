@@ -65,7 +65,7 @@ services:
     logging: *default-logging
 
   proxy:
-    image: caddy:2-alpine
+    image: caddy:2.11.4-alpine
     environment:
       FOFU_DOMAIN: ${FOFU_DOMAIN:?Set FOFU_DOMAIN in /etc/fofu/production.env}
       FOFU_TLS_EMAIL: ${FOFU_TLS_EMAIL:?Set FOFU_TLS_EMAIL in /etc/fofu/production.env}

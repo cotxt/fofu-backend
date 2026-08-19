@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import re
 import unicodedata
@@ -10,24 +11,40 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, or_, select
+from sqlalchemy import Integer, Text, and_, case, cast, exists, func, literal, or_, select, text
 from sqlalchemy.orm import Session, selectinload
 
 from app.models import (
     ExploreVideo as ExploreVideoModel,
 )
 from app.models import (
+    Ingredient as IngredientModel,
+)
+from app.models import (
     MenuCategory as MenuCategoryModel,
+)
+from app.models import (
+    MenuCategoryTranslation as MenuCategoryTranslationModel,
 )
 from app.models import (
     MenuItem as MenuItemModel,
 )
 from app.models import (
     MenuItemAllergen,
+    MenuItemDietaryClaim,
     MenuItemIngredient,
 )
 from app.models import (
+    MenuItemTranslation as MenuItemTranslationModel,
+)
+from app.models import (
+    OpeningHour as OpeningHourModel,
+)
+from app.models import (
     Restaurant as RestaurantModel,
+)
+from app.models import (
+    RestaurantTranslation as RestaurantTranslationModel,
 )
 from app.models import (
     Review as ReviewModel,
@@ -316,11 +333,7 @@ def serialize_menu_item(
         original_name=item.name_ko if item.name_ko and item.name_ko != name else None,
         pronunciation=pronunciation,
         description=description,
-        price=(
-            _money(item.price_amount, item.currency)
-            if item.price_amount is not None
-            else None
-        ),
+        price=(_money(item.price_amount, item.currency) if item.price_amount is not None else None),
         serving_description=item.serving_description,
         spice_level=item.spice_level,
         badge=item.badge,
@@ -486,6 +499,338 @@ _PRICE_BUCKETS: dict[str, tuple[int | None, int | None]] = {
 }
 
 _CURATED_TASTE_CODES = ("not-spicy", "mild", "rich", "light", "crispy")
+_LARGE_CATALOG_ITEM_THRESHOLD = 100_000
+
+
+def _catalog_is_large(db: Session) -> bool:
+    """Use PostgreSQL planner statistics to avoid a count scan on every request."""
+
+    if db.get_bind().dialect.name == "postgresql":
+        estimate = db.scalar(
+            text("SELECT reltuples::bigint FROM pg_class WHERE oid = 'menu_items'::regclass")
+        )
+        if estimate is not None:
+            return int(estimate) >= _LARGE_CATALOG_ITEM_THRESHOLD
+    count = db.scalar(select(func.count(MenuItemModel.id)))
+    return int(count or 0) >= _LARGE_CATALOG_ITEM_THRESHOLD
+
+
+def _sql_normalized_text(value: Any) -> Any:
+    """Apply the database-portable part of ``_fold`` to a text expression."""
+
+    return func.lower(func.replace(func.replace(func.coalesce(value, ""), "_", "-"), " ", "-"))
+
+
+def _sql_contains_any_alias(values: Sequence[Any], aliases: set[str]) -> Any:
+    predicates = []
+    for value in values:
+        padded = literal("-") + _sql_normalized_text(value) + literal("-")
+        predicates.extend(padded.like(f"%-{alias}-%") for alias in aliases)
+    return or_(*predicates)
+
+
+def _sql_main_ingredient_predicate(code: str) -> Any:
+    link_match: Any
+    aliases = _MAIN_INGREDIENT_GROUP_ALIASES.get(code)
+    if aliases is None:
+        link_match = _sql_normalized_text(MenuItemIngredient.ingredient_code) == code
+        from_clause = MenuItemIngredient
+    else:
+        link_match = _sql_contains_any_alias(
+            (
+                MenuItemIngredient.ingredient_code,
+                IngredientModel.name_en,
+                IngredientModel.name_ko,
+            ),
+            aliases,
+        )
+        from_clause = MenuItemIngredient.__table__.join(
+            IngredientModel,
+            IngredientModel.code == MenuItemIngredient.ingredient_code,
+        )
+    return exists(
+        select(1)
+        .select_from(from_clause)
+        .where(
+            MenuItemIngredient.menu_item_id == MenuItemModel.id,
+            link_match,
+        )
+        .correlate(MenuItemModel)
+    )
+
+
+def _sql_dish_type_predicate(code: str) -> Any:
+    aliases = _DISH_TYPE_GROUP_ALIASES.get(code)
+    if aliases is None:
+        return or_(
+            *(
+                _sql_normalized_text(value).contains(code, autoescape=True)
+                for value in (
+                    MenuCategoryModel.slug,
+                    MenuCategoryModel.name_en,
+                    MenuCategoryModel.name_ko,
+                )
+            )
+        )
+
+    base_match = _sql_contains_any_alias(
+        (
+            MenuCategoryModel.slug,
+            MenuCategoryModel.name_en,
+            MenuCategoryModel.name_ko,
+            MenuItemModel.slug,
+            MenuItemModel.name_en,
+            MenuItemModel.name_ko,
+            MenuItemModel.description_en,
+            MenuItemModel.description_ko,
+        ),
+        aliases,
+    )
+    category_translation_match = exists(
+        select(1)
+        .select_from(MenuCategoryTranslationModel)
+        .where(
+            MenuCategoryTranslationModel.category_id == MenuCategoryModel.id,
+            _sql_contains_any_alias((MenuCategoryTranslationModel.name,), aliases),
+        )
+        .correlate(MenuCategoryModel)
+    )
+    item_translation_match = exists(
+        select(1)
+        .select_from(MenuItemTranslationModel)
+        .where(
+            MenuItemTranslationModel.menu_item_id == MenuItemModel.id,
+            _sql_contains_any_alias(
+                (
+                    MenuItemTranslationModel.name,
+                    MenuItemTranslationModel.description,
+                ),
+                aliases,
+            ),
+        )
+        .correlate(MenuItemModel)
+    )
+    return or_(base_match, category_translation_match, item_translation_match)
+
+
+def _sql_taste_predicate(code: str) -> Any:
+    if code == "not-spicy":
+        return MenuItemModel.spice_level == 0
+    if code == "mild":
+        return MenuItemModel.spice_level <= 1
+    return MenuItemModel.taste_profile[code].as_float() >= 0.5
+
+
+def _sql_solo_friendly_predicate() -> Any:
+    raw = func.lower(func.coalesce(MenuItemModel.serving_description, ""))
+    normalized_words = raw
+    for separator in ("-", "_", "/", ",", ".", "(", ")"):
+        normalized_words = func.replace(normalized_words, separator, " ")
+    padded_words = literal(" ") + normalized_words + literal(" ")
+    word_matches = [
+        padded_words.like(f"% {word} %")
+        for word in ("one", "single", "solo", "individual", "personal")
+    ]
+    marker_matches = [
+        raw.contains(marker, autoescape=True)
+        for marker in ("1-person", "for-one", "serves-one", "one-person", "1인", "일인")
+    ]
+    return or_(*word_matches, *marker_matches)
+
+
+def _sql_item_filter_predicates(
+    *,
+    diet_codes: set[str],
+    excluded_allergen_codes: set[str],
+    ingredient_codes: set[str],
+    spicy: bool | None,
+    max_price: int | None,
+    main_ingredient_codes: set[str],
+    dish_type_codes: set[str],
+    price_codes: set[str],
+    taste_codes: set[str],
+    solo_friendly: bool,
+    require_taste_evidence: bool = False,
+    require_allergen_evidence: bool = False,
+    treat_zero_spice_as_unknown: bool = False,
+    require_solo_evidence: bool = False,
+) -> list[Any]:
+    predicates: list[Any] = []
+    for code in diet_codes:
+        source_codes = {
+            source for source, implications in _DIET_IMPLICATIONS.items() if code in implications
+        }
+        source_codes.add(code)
+        predicates.append(
+            exists(
+                select(1)
+                .select_from(MenuItemDietaryClaim)
+                .where(
+                    MenuItemDietaryClaim.menu_item_id == MenuItemModel.id,
+                    _sql_normalized_text(MenuItemDietaryClaim.code).in_(source_codes),
+                )
+                .correlate(MenuItemModel)
+            )
+        )
+    if excluded_allergen_codes:
+        if require_allergen_evidence:
+            for code in excluded_allergen_codes:
+                predicates.append(
+                    exists(
+                        select(1)
+                        .select_from(MenuItemAllergen)
+                        .where(
+                            MenuItemAllergen.menu_item_id == MenuItemModel.id,
+                            MenuItemAllergen.relation_type.in_(_NEGATIVE_ALLERGEN_RELATIONS),
+                            MenuItemAllergen.verification_status.not_in(("unknown", "unverified")),
+                            _sql_normalized_text(MenuItemAllergen.allergen_code) == code,
+                        )
+                        .correlate(MenuItemModel)
+                    )
+                )
+        else:
+            predicates.append(
+                ~exists(
+                    select(1)
+                    .select_from(MenuItemAllergen)
+                    .where(
+                        MenuItemAllergen.menu_item_id == MenuItemModel.id,
+                        MenuItemAllergen.relation_type.in_(_POSITIVE_ALLERGEN_RELATIONS),
+                        _sql_normalized_text(MenuItemAllergen.allergen_code).in_(
+                            excluded_allergen_codes
+                        ),
+                    )
+                    .correlate(MenuItemModel)
+                )
+            )
+    for code in ingredient_codes:
+        predicates.append(
+            exists(
+                select(1)
+                .select_from(MenuItemIngredient)
+                .where(
+                    MenuItemIngredient.menu_item_id == MenuItemModel.id,
+                    _sql_normalized_text(MenuItemIngredient.ingredient_code) == code,
+                )
+                .correlate(MenuItemModel)
+            )
+        )
+    if spicy is True:
+        predicates.append(MenuItemModel.spice_level > 0)
+    elif spicy is False:
+        predicates.append(
+            literal(False) if treat_zero_spice_as_unknown else MenuItemModel.spice_level <= 0
+        )
+    if max_price is not None:
+        predicates.extend(
+            (
+                MenuItemModel.price_amount.is_not(None),
+                MenuItemModel.price_amount <= max_price,
+            )
+        )
+    if main_ingredient_codes:
+        predicates.append(
+            or_(*(_sql_main_ingredient_predicate(code) for code in main_ingredient_codes))
+        )
+    if dish_type_codes:
+        predicates.append(or_(*(_sql_dish_type_predicate(code) for code in dish_type_codes)))
+    if price_codes:
+        bucket_predicates = []
+        for code in price_codes:
+            bounds = _PRICE_BUCKETS.get(code)
+            if bounds is None:
+                continue
+            minimum, maximum_exclusive = bounds
+            bucket = [MenuItemModel.price_amount.is_not(None)]
+            if minimum is not None:
+                bucket.append(MenuItemModel.price_amount >= minimum)
+            if maximum_exclusive is not None:
+                bucket.append(MenuItemModel.price_amount < maximum_exclusive)
+            bucket_predicates.append(and_(*bucket))
+        predicates.append(or_(*bucket_predicates) if bucket_predicates else literal(False))
+    if taste_codes:
+        if require_taste_evidence:
+            predicates.append(literal(False))
+        else:
+            predicates.append(or_(*(_sql_taste_predicate(code) for code in taste_codes)))
+    if solo_friendly:
+        predicates.append(
+            literal(False) if require_solo_evidence else _sql_solo_friendly_predicate()
+        )
+    return predicates
+
+
+def _sql_open_now_predicate(
+    db: Session,
+    now: datetime,
+    *,
+    require_hours: bool = False,
+) -> Any:
+    no_hours = ~exists(
+        select(1)
+        .select_from(OpeningHourModel)
+        .where(OpeningHourModel.restaurant_id == RestaurantModel.id)
+        .correlate(RestaurantModel)
+    )
+    timezone_names = list(
+        db.scalars(
+            select(RestaurantModel.timezone_name)
+            .where(RestaurantModel.is_published.is_(True))
+            .distinct()
+        )
+    )
+    timezone_predicates = []
+    for timezone_name in timezone_names:
+        try:
+            local_now = now.astimezone(ZoneInfo(timezone_name))
+        except ZoneInfoNotFoundError:
+            local_now = now
+        today_index = local_now.weekday()
+        current_time = local_now.time().replace(tzinfo=None)
+        today = exists(
+            select(1)
+            .select_from(OpeningHourModel)
+            .where(
+                OpeningHourModel.restaurant_id == RestaurantModel.id,
+                OpeningHourModel.day_of_week == today_index,
+                OpeningHourModel.is_closed.is_(False),
+                OpeningHourModel.opens_at.is_not(None),
+                OpeningHourModel.closes_at.is_not(None),
+                or_(
+                    OpeningHourModel.opens_at == OpeningHourModel.closes_at,
+                    and_(
+                        OpeningHourModel.closes_at > OpeningHourModel.opens_at,
+                        OpeningHourModel.opens_at <= current_time,
+                        OpeningHourModel.closes_at > current_time,
+                    ),
+                    and_(
+                        OpeningHourModel.closes_at < OpeningHourModel.opens_at,
+                        OpeningHourModel.opens_at <= current_time,
+                    ),
+                ),
+            )
+            .correlate(RestaurantModel)
+        )
+        previous = exists(
+            select(1)
+            .select_from(OpeningHourModel)
+            .where(
+                OpeningHourModel.restaurant_id == RestaurantModel.id,
+                OpeningHourModel.day_of_week == (today_index - 1) % 7,
+                OpeningHourModel.is_closed.is_(False),
+                OpeningHourModel.opens_at.is_not(None),
+                OpeningHourModel.closes_at.is_not(None),
+                OpeningHourModel.closes_at < OpeningHourModel.opens_at,
+                OpeningHourModel.closes_at > current_time,
+            )
+            .correlate(RestaurantModel)
+        )
+        timezone_predicates.append(
+            and_(RestaurantModel.timezone_name == timezone_name, or_(today, previous))
+        )
+    scheduled_open = or_(*timezone_predicates) if timezone_predicates else literal(False)
+    hours_match = scheduled_open if require_hours else or_(no_hours, scheduled_open)
+    return and_(RestaurantModel.is_open.is_(True), hours_match)
 
 
 def _contains_alias(value: str, aliases: set[str]) -> bool:
@@ -894,6 +1239,7 @@ def nearby_restaurants(
     dish_types = _codes(dish_type_codes)
     prices = _codes(price_codes)
     tastes = _codes(taste_codes)
+    large_catalog = _catalog_is_large(db)
     has_item_filters = bool(
         diets
         or excluded
@@ -905,8 +1251,14 @@ def nearby_restaurants(
         or spicy is not None
         or solo_friendly
     )
-    normalized_category = _fold(category)
-    if not has_item_filters and not open_now and min_rating is None and not normalized_category:
+    normalized_category = unicodedata.normalize("NFC", (category or "").strip().casefold())
+    if (
+        not large_catalog
+        and not has_item_filters
+        and not open_now
+        and min_rating is None
+        and not normalized_category
+    ):
         return _unfiltered_nearby_restaurants(
             db,
             latitude=latitude,
@@ -918,55 +1270,174 @@ def nearby_restaurants(
             user=user,
         )
 
-    matches: list[tuple[int, RestaurantModel, MenuItemModel | None]] = []
-
-    for restaurant in _load_restaurants(
-        db, latitude=latitude, longitude=longitude, radius_m=radius_m
-    ):
-        distance = haversine_meters(latitude, longitude, restaurant.latitude, restaurant.longitude)
-        if distance > radius_m:
-            continue
-        if open_now and not restaurant_is_open(restaurant):
-            continue
-        if min_rating is not None and float(restaurant.rating_avg) < min_rating:
-            continue
-        if normalized_category and normalized_category not in _fold(restaurant.category):
-            continue
-        compatible = _matching_items(
-            restaurant,
-            diet_codes=diets,
-            excluded_allergen_codes=excluded,
-            ingredient_codes=ingredients,
-            spicy=spicy,
-            main_ingredient_codes=main_ingredients,
-            dish_type_codes=dish_types,
-            price_codes=prices,
-            taste_codes=tastes,
-            solo_friendly=solo_friendly,
+    latitude_delta = radius_m / 111_320
+    longitude_scale = max(abs(math.cos(math.radians(latitude))), 0.01)
+    longitude_delta = radius_m / (111_320 * longitude_scale)
+    distance_expression = _sql_distance_meters(latitude, longitude)
+    restaurant_predicates: list[Any] = [
+        RestaurantModel.is_published.is_(True),
+        RestaurantModel.latitude.between(
+            latitude - latitude_delta,
+            latitude + latitude_delta,
+        ),
+        RestaurantModel.longitude.between(
+            longitude - longitude_delta,
+            longitude + longitude_delta,
+        ),
+        distance_expression <= radius_m,
+    ]
+    if open_now:
+        restaurant_predicates.append(
+            _sql_open_now_predicate(
+                db,
+                datetime.now(timezone.utc),
+                require_hours=large_catalog,
+            )
         )
-        if has_item_filters and not compatible:
-            continue
-        matches.append((distance, restaurant, next(iter(compatible), None)))
+    if min_rating is not None:
+        restaurant_predicates.append(RestaurantModel.rating_avg >= min_rating)
+    if normalized_category:
+        restaurant_predicates.append(
+            func.lower(RestaurantModel.category).contains(normalized_category, autoescape=True)
+        )
 
-    matches.sort(key=lambda row: (row[0], -float(row[1].rating_avg), row[1].slug))
+    item_predicates = _sql_item_filter_predicates(
+        diet_codes=diets,
+        excluded_allergen_codes=excluded,
+        ingredient_codes=ingredients,
+        spicy=spicy,
+        max_price=None,
+        main_ingredient_codes=main_ingredients,
+        dish_type_codes=dish_types,
+        price_codes=prices,
+        taste_codes=tastes,
+        solo_friendly=solo_friendly,
+        require_taste_evidence=large_catalog,
+        require_allergen_evidence=large_catalog,
+        treat_zero_spice_as_unknown=large_catalog,
+        require_solo_evidence=large_catalog,
+    )
+    matching_item_from = MenuItemModel.__table__.join(
+        MenuCategoryModel,
+        MenuCategoryModel.id == MenuItemModel.category_id,
+    )
+    if has_item_filters:
+        restaurant_predicates.append(
+            exists(
+                select(1)
+                .select_from(matching_item_from)
+                .where(
+                    MenuItemModel.restaurant_id == RestaurantModel.id,
+                    MenuCategoryModel.is_active.is_(True),
+                    MenuItemModel.is_available.is_(True),
+                    *item_predicates,
+                )
+                .correlate(RestaurantModel)
+            )
+        )
+
     offset = decode_cursor(cursor)
-    page = matches[offset : offset + limit]
-    next_offset = offset + len(page)
-    has_more = next_offset < len(matches)
+    page_rows = list(
+        db.execute(
+            select(
+                RestaurantModel.id,
+                distance_expression.label("distance_m"),
+                func.count().over().label("total_count"),
+            )
+            .where(*restaurant_predicates)
+            .order_by(
+                distance_expression,
+                RestaurantModel.rating_avg.desc(),
+                RestaurantModel.slug,
+            )
+            .offset(offset)
+            .limit(limit)
+        )
+    )
+    if page_rows:
+        total = int(page_rows[0].total_count)
+    elif offset:
+        total = int(
+            db.scalar(select(func.count(RestaurantModel.id)).where(*restaurant_predicates)) or 0
+        )
+    else:
+        total = 0
+    next_offset = offset + len(page_rows)
+    has_more = next_offset < total
+
+    page_ids = [str(row.id) for row in page_rows]
+    featured_item_id_by_restaurant: dict[str, str] = {}
+    if page_ids:
+        ranked_items = (
+            select(
+                MenuItemModel.id.label("item_id"),
+                MenuItemModel.restaurant_id.label("restaurant_id"),
+                func.row_number()
+                .over(
+                    partition_by=MenuItemModel.restaurant_id,
+                    order_by=(
+                        MenuCategoryModel.sort_order,
+                        MenuCategoryModel.id,
+                        MenuItemModel.sort_order,
+                        MenuItemModel.id,
+                    ),
+                )
+                .label("row_number"),
+            )
+            .select_from(matching_item_from)
+            .where(
+                MenuItemModel.restaurant_id.in_(page_ids),
+                MenuCategoryModel.is_active.is_(True),
+                MenuItemModel.is_available.is_(True),
+                *(item_predicates if has_item_filters else ()),
+            )
+            .subquery()
+        )
+        featured_item_id_by_restaurant = {
+            str(restaurant_id): str(item_id)
+            for item_id, restaurant_id in db.execute(
+                select(ranked_items.c.item_id, ranked_items.c.restaurant_id).where(
+                    ranked_items.c.row_number == 1
+                )
+            )
+        }
+
+    featured_item_ids = list(featured_item_id_by_restaurant.values())
+    featured_items = {
+        item.id: item
+        for item in db.scalars(
+            select(MenuItemModel)
+            .where(MenuItemModel.id.in_(featured_item_ids))
+            .options(*_item_options())
+        ).unique()
+    }
+    page_restaurants = {
+        restaurant.id: restaurant
+        for restaurant in db.scalars(
+            select(RestaurantModel)
+            .where(RestaurantModel.id.in_(page_ids))
+            .options(
+                selectinload(RestaurantModel.translations),
+                selectinload(RestaurantModel.hours),
+            )
+        ).unique()
+    }
     return RestaurantPage(
         items=[
             serialize_restaurant(
-                restaurant,
+                page_restaurants[str(row.id)],
                 locale,
-                distance_m=distance,
-                featured_item=featured_item,
+                distance_m=int(row.distance_m),
+                featured_item=(
+                    featured_items.get(featured_item_id_by_restaurant.get(str(row.id), ""))
+                ),
                 user=user,
             )
-            for distance, restaurant, featured_item in page
+            for row in page_rows
         ],
         next_cursor=encode_cursor(next_offset) if has_more else None,
         has_more=has_more,
-        total=len(matches),
+        total=total,
     )
 
 
@@ -1194,6 +1665,179 @@ def _search_blob(
     return _fold(" ".join(values))
 
 
+def _sql_text_match(values: Sequence[Any], query: str) -> Any:
+    return or_(
+        *(func.lower(func.coalesce(value, "")).contains(query, autoescape=True) for value in values)
+    )
+
+
+def _sql_localized_item_name(locale: str) -> Any:
+    normalized = normalize_locale(locale)
+    language = normalized.split("-", 1)[0]
+    translated_name = (
+        select(MenuItemTranslationModel.name)
+        .where(
+            MenuItemTranslationModel.menu_item_id == MenuItemModel.id,
+            or_(
+                MenuItemTranslationModel.locale == normalized,
+                MenuItemTranslationModel.locale == language,
+                MenuItemTranslationModel.locale.like(f"{language}-%"),
+            ),
+        )
+        .order_by(case((MenuItemTranslationModel.locale == normalized, 0), else_=1))
+        .limit(1)
+        .correlate(MenuItemModel)
+        .scalar_subquery()
+    )
+    fallback = (
+        func.coalesce(MenuItemModel.name_ko, MenuItemModel.name_en)
+        if normalized == "ko"
+        else MenuItemModel.name_en
+    )
+    return func.coalesce(translated_name, fallback)
+
+
+def _sql_search_matches(
+    query: str,
+    locale: str,
+    *,
+    include_enrichment: bool,
+) -> tuple[Any, Any]:
+    restaurant_values: tuple[Any, ...] = (
+        RestaurantModel.name_en,
+        RestaurantModel.name_ko,
+    )
+    if include_enrichment:
+        restaurant_values += (
+            RestaurantModel.description_en,
+            RestaurantModel.description_ko,
+            RestaurantModel.category,
+        )
+    restaurant_match = _sql_text_match(restaurant_values, query)
+    base_values: tuple[Any, ...] = (
+        *restaurant_values,
+        MenuItemModel.name_en,
+        MenuItemModel.name_ko,
+    )
+    if include_enrichment:
+        base_values += (
+            MenuCategoryModel.slug,
+            MenuCategoryModel.name_en,
+            MenuCategoryModel.name_ko,
+            MenuItemModel.slug,
+            MenuItemModel.description_en,
+            MenuItemModel.description_ko,
+        )
+    base_match = _sql_text_match(
+        base_values,
+        query,
+    )
+    if not include_enrichment:
+        return restaurant_match, base_match
+
+    normalized_locale = normalize_locale(locale)
+    language = normalized_locale.split("-", 1)[0]
+    localized_restaurant_match = exists(
+        select(1)
+        .select_from(RestaurantTranslationModel)
+        .where(
+            RestaurantTranslationModel.restaurant_id == RestaurantModel.id,
+            or_(
+                RestaurantTranslationModel.locale == normalized_locale,
+                RestaurantTranslationModel.locale == language,
+                RestaurantTranslationModel.locale.like(f"{language}-%"),
+            ),
+            _sql_text_match(
+                (
+                    RestaurantTranslationModel.name,
+                    RestaurantTranslationModel.description,
+                ),
+                query,
+            ),
+        )
+        .correlate(RestaurantModel)
+    )
+    localized_category_match = exists(
+        select(1)
+        .select_from(MenuCategoryTranslationModel)
+        .where(
+            MenuCategoryTranslationModel.category_id == MenuCategoryModel.id,
+            or_(
+                MenuCategoryTranslationModel.locale == normalized_locale,
+                MenuCategoryTranslationModel.locale == language,
+                MenuCategoryTranslationModel.locale.like(f"{language}-%"),
+            ),
+            _sql_text_match((MenuCategoryTranslationModel.name,), query),
+        )
+        .correlate(MenuCategoryModel)
+    )
+    item_translation_match = exists(
+        select(1)
+        .select_from(MenuItemTranslationModel)
+        .where(
+            MenuItemTranslationModel.menu_item_id == MenuItemModel.id,
+            _sql_text_match(
+                (
+                    MenuItemTranslationModel.name,
+                    MenuItemTranslationModel.description,
+                ),
+                query,
+            ),
+        )
+        .correlate(MenuItemModel)
+    )
+    ingredient_match = exists(
+        select(1)
+        .select_from(
+            MenuItemIngredient.__table__.join(
+                IngredientModel,
+                IngredientModel.code == MenuItemIngredient.ingredient_code,
+            )
+        )
+        .where(
+            MenuItemIngredient.menu_item_id == MenuItemModel.id,
+            _sql_text_match(
+                (
+                    MenuItemIngredient.ingredient_code,
+                    IngredientModel.name_en,
+                    IngredientModel.name_ko,
+                ),
+                query,
+            ),
+        )
+        .correlate(MenuItemModel)
+    )
+    claim_match = exists(
+        select(1)
+        .select_from(MenuItemDietaryClaim)
+        .where(
+            MenuItemDietaryClaim.menu_item_id == MenuItemModel.id,
+            _sql_text_match((MenuItemDietaryClaim.code,), query),
+        )
+        .correlate(MenuItemModel)
+    )
+    return restaurant_match, or_(
+        base_match,
+        localized_restaurant_match,
+        localized_category_match,
+        item_translation_match,
+        ingredient_match,
+        claim_match,
+    )
+
+
+def _sql_distance_meters(latitude: float, longitude: float) -> Any:
+    latitude_delta = func.radians(RestaurantModel.latitude - latitude)
+    longitude_delta = func.radians(RestaurantModel.longitude - longitude)
+    haversine = func.power(func.sin(latitude_delta / 2), 2) + func.cos(
+        func.radians(latitude)
+    ) * func.cos(func.radians(RestaurantModel.latitude)) * func.power(
+        func.sin(longitude_delta / 2), 2
+    )
+    clamped = case((haversine > 1, 1.0), else_=haversine)
+    return cast(func.round(6_371_000.0 * 2 * func.asin(func.sqrt(clamped))), Integer)
+
+
 def search_catalog(
     db: Session,
     *,
@@ -1220,7 +1864,9 @@ def search_catalog(
     limit: int = 20,
     user: UserModel | None = None,
 ) -> SearchResults:
-    normalized_query = _fold(query.strip())
+    # Database text is stored in NFC (not the NFKD form used by Python-side matching).
+    # Keeping SQL input in NFC is essential for Korean syllable searches.
+    normalized_query = unicodedata.normalize("NFC", query.strip().casefold())
     diets = _codes(diet_codes)
     excluded = _codes(excluded_allergen_codes)
     ingredients = _codes(ingredient_codes)
@@ -1228,104 +1874,230 @@ def search_catalog(
     dish_types = _codes(dish_type_codes)
     prices = _codes(price_codes)
     tastes = _codes(taste_codes)
+    large_catalog = _catalog_is_large(db)
+    if large_catalog and (latitude is None or longitude is None or radius_m is None):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "code": "search_area_required",
+                "message": "lat, lng, and radius_m are required for the production catalog.",
+            },
+        )
     if dish_type:
         dish_types.update(_codes((dish_type,)))
     if taste:
         tastes.update(_codes((taste,)))
-    rows: list[tuple[int, int, RestaurantModel, MenuCategoryModel, MenuItemModel]] = []
-
-    restaurants = _load_restaurants(
-        db,
-        latitude=latitude,
-        longitude=longitude,
-        radius_m=radius_m if latitude is not None and longitude is not None else None,
+    from_clause = MenuItemModel.__table__.join(
+        MenuCategoryModel,
+        MenuCategoryModel.id == MenuItemModel.category_id,
+    ).join(
+        RestaurantModel,
+        RestaurantModel.id == MenuItemModel.restaurant_id,
     )
-    for restaurant in restaurants:
-        distance = (
-            haversine_meters(latitude, longitude, restaurant.latitude, restaurant.longitude)
-            if latitude is not None and longitude is not None
-            else 0
+    predicates: list[Any] = [
+        RestaurantModel.is_published.is_(True),
+        MenuCategoryModel.is_active.is_(True),
+        MenuItemModel.is_available.is_(True),
+    ]
+    predicates.extend(
+        _sql_item_filter_predicates(
+            diet_codes=diets,
+            excluded_allergen_codes=excluded,
+            ingredient_codes=ingredients,
+            spicy=spicy,
+            max_price=max_price,
+            main_ingredient_codes=main_ingredients,
+            dish_type_codes=dish_types,
+            price_codes=prices,
+            taste_codes=tastes,
+            solo_friendly=solo_friendly,
+            require_taste_evidence=large_catalog,
+            require_allergen_evidence=large_catalog,
+            treat_zero_spice_as_unknown=large_catalog,
+            require_solo_evidence=large_catalog,
         )
-        if radius_m is not None and distance > radius_m:
-            continue
-        if open_now and not restaurant_is_open(restaurant):
-            continue
-        if min_rating is not None and float(restaurant.rating_avg) < min_rating:
-            continue
+    )
 
-        restaurant_blob = _fold(
-            " ".join(
-                value
-                for value in (
-                    restaurant.name_en,
-                    restaurant.name_ko,
-                    restaurant.description_en,
-                    restaurant.description_ko,
-                    restaurant.category,
+    distance_expression: Any = literal(0)
+    if latitude is not None and longitude is not None:
+        distance_expression = _sql_distance_meters(latitude, longitude)
+        if radius_m is not None:
+            latitude_delta = radius_m / 111_320
+            longitude_scale = max(abs(math.cos(math.radians(latitude))), 0.01)
+            longitude_delta = radius_m / (111_320 * longitude_scale)
+            predicates.extend(
+                (
+                    RestaurantModel.latitude.between(
+                        latitude - latitude_delta,
+                        latitude + latitude_delta,
+                    ),
+                    RestaurantModel.longitude.between(
+                        longitude - longitude_delta,
+                        longitude + longitude_delta,
+                    ),
+                    distance_expression <= radius_m,
                 )
-                if value
+            )
+    if open_now:
+        predicates.append(
+            _sql_open_now_predicate(
+                db,
+                datetime.now(timezone.utc),
+                require_hours=large_catalog,
             )
         )
-        restaurant_match = bool(normalized_query and normalized_query in restaurant_blob)
-        for category in restaurant.menu_categories:
-            if not category.is_active:
-                continue
-            for item in category.items:
-                if not item.is_available or not _item_matches_filters(
-                    item,
-                    diet_codes=diets,
-                    excluded_allergen_codes=excluded,
-                    ingredient_codes=ingredients,
-                    spicy=spicy,
-                    max_price=max_price,
-                    main_ingredient_codes=main_ingredients,
-                    dish_type_codes=dish_types,
-                    price_codes=prices,
-                    taste_codes=tastes,
-                    solo_friendly=solo_friendly,
-                    category=category,
-                ):
-                    continue
-                blob = _search_blob(restaurant, category, item, locale)
-                if normalized_query and normalized_query not in blob and not restaurant_match:
-                    continue
-                localized_name, _, _ = _item_text(item, locale)
-                folded_name = _fold(localized_name)
-                score = 0
-                if normalized_query:
-                    if folded_name == normalized_query:
-                        score = 12
-                    elif folded_name.startswith(normalized_query):
-                        score = 9
-                    elif normalized_query in folded_name:
-                        score = 7
-                    elif restaurant_match:
-                        score = 4
-                    else:
-                        score = 2
-                rows.append((score, distance, restaurant, category, item))
+    if min_rating is not None:
+        predicates.append(RestaurantModel.rating_avg >= min_rating)
 
-    rows.sort(
-        key=lambda row: (
-            -row[0],
-            row[1],
-            -float(row[2].rating_avg),
-            row[2].slug,
-            row[4].sort_order,
-            row[4].id,
+    if normalized_query:
+        restaurant_match, catalog_match = _sql_search_matches(
+            normalized_query,
+            locale,
+            include_enrichment=not large_catalog,
         )
-    )
-    restaurant_hits: dict[str, tuple[int, RestaurantModel, MenuItemModel]] = {}
-    for _, distance, restaurant, _, item in rows:
-        restaurant_hits.setdefault(restaurant.id, (distance, restaurant, item))
+        predicates.append(catalog_match)
+        localized_name = func.lower(
+            func.coalesce(MenuItemModel.name_ko, MenuItemModel.name_en)
+            if large_catalog and normalize_locale(locale) == "ko"
+            else (MenuItemModel.name_en if large_catalog else _sql_localized_item_name(locale))
+        )
+        score_expression: Any = case(
+            (localized_name == normalized_query, 12),
+            (localized_name.startswith(normalized_query, autoescape=True), 9),
+            (localized_name.contains(normalized_query, autoescape=True), 7),
+            (restaurant_match, 4),
+            else_=2,
+        )
+    else:
+        score_expression = literal(0)
 
     offset = decode_cursor(cursor)
-    page = rows[offset : offset + limit]
-    next_offset = offset + len(page)
-    has_more = next_offset < len(rows)
+    if large_catalog and normalized_query:
+        candidates = (
+            select(
+                MenuItemModel.id.label("item_id"),
+                RestaurantModel.id.label("restaurant_id"),
+                distance_expression.label("distance_m"),
+                score_expression.label("score"),
+                RestaurantModel.rating_avg.label("rating_avg"),
+                RestaurantModel.slug.label("restaurant_slug"),
+                MenuItemModel.sort_order.label("item_sort_order"),
+            )
+            .select_from(from_clause)
+            .where(*predicates)
+            .cte("search_candidates")
+        )
+        raw_page_rows = list(
+            db.execute(
+                select(
+                    candidates.c.item_id,
+                    candidates.c.restaurant_id,
+                    candidates.c.distance_m,
+                    select(func.count()).select_from(candidates).scalar_subquery(),
+                    select(func.count(func.distinct(candidates.c.restaurant_id)))
+                    .select_from(candidates)
+                    .scalar_subquery(),
+                )
+                .order_by(
+                    candidates.c.score.desc(),
+                    candidates.c.distance_m,
+                    candidates.c.rating_avg.desc(),
+                    candidates.c.restaurant_slug,
+                    candidates.c.item_sort_order,
+                    candidates.c.item_id,
+                )
+                .offset(offset)
+                .limit(limit)
+            )
+        )
+        if raw_page_rows:
+            item_count = int(raw_page_rows[0][3] or 0)
+            restaurant_count = int(raw_page_rows[0][4] or 0)
+        elif offset:
+            item_count, restaurant_count = db.execute(
+                select(
+                    func.count(),
+                    func.count(func.distinct(candidates.c.restaurant_id)),
+                ).select_from(candidates)
+            ).one()
+            item_count = int(item_count or 0)
+            restaurant_count = int(restaurant_count or 0)
+        else:
+            item_count = restaurant_count = 0
+        page_rows = [(row[0], row[1], row[2]) for row in raw_page_rows]
+    else:
+        item_count, restaurant_count = db.execute(
+            select(
+                func.count(MenuItemModel.id),
+                func.count(func.distinct(RestaurantModel.id)),
+            )
+            .select_from(from_clause)
+            .where(*predicates)
+        ).one()
+        item_count = int(item_count or 0)
+        restaurant_count = int(restaurant_count or 0)
+        page_rows = list(
+            db.execute(
+                select(
+                    MenuItemModel.id,
+                    RestaurantModel.id,
+                    distance_expression.label("distance_m"),
+                )
+                .select_from(from_clause)
+                .where(*predicates)
+                .order_by(
+                    score_expression.desc(),
+                    distance_expression,
+                    RestaurantModel.rating_avg.desc(),
+                    RestaurantModel.slug,
+                    MenuItemModel.sort_order,
+                    MenuItemModel.id,
+                )
+                .offset(offset)
+                .limit(limit)
+            )
+        )
+    next_offset = offset + len(page_rows)
+    has_more = next_offset < item_count
+
+    page_item_ids = [item_id for item_id, _, _ in page_rows]
+    page_restaurant_ids = list(dict.fromkeys(restaurant_id for _, restaurant_id, _ in page_rows))
+    items_by_id: dict[str, MenuItemModel] = {}
+    restaurants_by_id: dict[str, RestaurantModel] = {}
+    if page_item_ids:
+        items_by_id = {
+            item.id: item
+            for item in db.scalars(
+                select(MenuItemModel)
+                .where(MenuItemModel.id.in_(page_item_ids))
+                .options(*_item_options())
+            ).unique()
+        }
+        restaurants_by_id = {
+            restaurant.id: restaurant
+            for restaurant in db.scalars(
+                select(RestaurantModel)
+                .where(RestaurantModel.id.in_(page_restaurant_ids))
+                .options(
+                    selectinload(RestaurantModel.translations),
+                    selectinload(RestaurantModel.hours),
+                )
+            ).unique()
+        }
+
+    page = [
+        (int(distance or 0), restaurants_by_id[restaurant_id], items_by_id[item_id])
+        for item_id, restaurant_id, distance in page_rows
+    ]
+    # Restaurant summaries are intentionally derived from the bounded item page. The old
+    # implementation returned every matching restaurant, which made a single search response
+    # unbounded even though menu items themselves were paginated.
+    restaurant_hits: dict[str, tuple[int, RestaurantModel, MenuItemModel]] = {}
+    for distance, restaurant, item in page:
+        restaurant_hits.setdefault(restaurant.id, (distance, restaurant, item))
     return SearchResults(
         query=query.strip(),
-        items=[serialize_menu_item(item, locale, user) for _, _, _, _, item in page],
+        items=[serialize_menu_item(item, locale, user) for _, _, item in page],
         restaurants=[
             serialize_restaurant(
                 restaurant,
@@ -1336,8 +2108,8 @@ def search_catalog(
             )
             for distance, restaurant, item in restaurant_hits.values()
         ],
-        item_count=len(rows),
-        restaurant_count=len(restaurant_hits),
+        item_count=item_count,
+        restaurant_count=restaurant_count,
         next_cursor=encode_cursor(next_offset) if has_more else None,
         has_more=has_more,
     )
@@ -1375,52 +2147,254 @@ def _section_title(key: str, locale: str) -> str:
 
 
 def search_facets(db: Session, *, locale: str) -> SearchFacets:
-    restaurants = _load_restaurants(db)
-    ingredient_items: dict[str, set[str]] = defaultdict(set)
-    ingredient_labels: dict[str, tuple[str, str | None]] = {}
-    main_group_items: dict[str, set[str]] = {code: set() for code in _MAIN_INGREDIENT_GROUP_ALIASES}
-    category_items: dict[str, set[str]] = defaultdict(set)
-    category_labels: dict[str, str] = {}
-    dish_group_items: dict[str, set[str]] = {code: set() for code in _DISH_TYPE_GROUP_ALIASES}
-    claim_items: dict[str, set[str]] = defaultdict(set)
-    taste_items: dict[str, set[str]] = defaultdict(set)
-    curated_taste_items: dict[str, set[str]] = {code: set() for code in _CURATED_TASTE_CODES}
-    prices = {code: 0 for code in _PRICE_BUCKETS}
-    solo_restaurant_ids: set[str] = set()
-    for restaurant in restaurants:
-        for category in restaurant.menu_categories:
-            if not category.is_active:
-                continue
-            for item in category.items:
-                if not item.is_available:
-                    continue
-                for code in main_group_items:
-                    if _item_matches_main_ingredients(item, {code}):
-                        main_group_items[code].add(item.id)
-                category_items[category.slug].add(item.id)
-                category_labels[category.slug] = _category_name(category, locale)
-                for code in dish_group_items:
-                    if _item_matches_dish_types(item, category, {code}):
-                        dish_group_items[code].add(item.id)
-                for link in item.ingredient_links:
-                    ingredient_items[link.ingredient_code].add(item.id)
-                    ingredient_labels[link.ingredient_code] = (
-                        localized(link.ingredient.name_en, link.ingredient.name_ko, locale),
-                        link.ingredient.emoji,
+    large_catalog = _catalog_is_large(db)
+    eligible_from = MenuItemModel.__table__.join(
+        MenuCategoryModel,
+        MenuCategoryModel.id == MenuItemModel.category_id,
+    ).join(
+        RestaurantModel,
+        RestaurantModel.id == MenuItemModel.restaurant_id,
+    )
+    eligible = (
+        RestaurantModel.is_published.is_(True),
+        MenuCategoryModel.is_active.is_(True),
+        MenuItemModel.is_available.is_(True),
+    )
+    aggregate_from = eligible_from
+    aggregate_eligible = eligible
+
+    ingredient_from = (
+        MenuItemIngredient.__table__.join(
+            IngredientModel,
+            IngredientModel.code == MenuItemIngredient.ingredient_code,
+        )
+        .join(MenuItemModel, MenuItemModel.id == MenuItemIngredient.menu_item_id)
+        .join(MenuCategoryModel, MenuCategoryModel.id == MenuItemModel.category_id)
+        .join(RestaurantModel, RestaurantModel.id == MenuItemModel.restaurant_id)
+    )
+    ingredient_rows = list(
+        db.execute(
+            select(
+                MenuItemIngredient.ingredient_code,
+                IngredientModel.name_en,
+                IngredientModel.name_ko,
+                IngredientModel.emoji,
+                func.count(func.distinct(MenuItemModel.id)),
+            )
+            .select_from(ingredient_from)
+            .where(*eligible)
+            .group_by(
+                MenuItemIngredient.ingredient_code,
+                IngredientModel.name_en,
+                IngredientModel.name_ko,
+                IngredientModel.emoji,
+            )
+        )
+    )
+    ingredient_items = {str(row[0]): int(row[4]) for row in ingredient_rows}
+    ingredient_labels = {
+        str(code): (localized(name_en, name_ko, locale), emoji)
+        for code, name_en, name_ko, emoji, _ in ingredient_rows
+    }
+    main_count_columns = [
+        func.count(
+            func.distinct(
+                case(
+                    (
+                        _sql_contains_any_alias(
+                            (
+                                MenuItemIngredient.ingredient_code,
+                                IngredientModel.name_en,
+                                IngredientModel.name_ko,
+                            ),
+                            aliases,
+                        ),
+                        MenuItemModel.id,
                     )
-                for claim in item.dietary_claims:
-                    claim_items[claim.code].add(item.id)
-                for taste, strength in (item.taste_profile or {}).items():
-                    if strength >= 0.5:
-                        taste_items[taste].add(item.id)
-                for code in curated_taste_items:
-                    if _item_matches_taste_code(item, code):
-                        curated_taste_items[code].add(item.id)
-                for code in prices:
-                    if _item_matches_price_codes(item, {code}):
-                        prices[code] += 1
-                if _item_is_solo_friendly(item):
-                    solo_restaurant_ids.add(restaurant.id)
+                )
+            )
+        )
+        for aliases in _MAIN_INGREDIENT_GROUP_ALIASES.values()
+    ]
+    main_count_values = db.execute(
+        select(*main_count_columns).select_from(ingredient_from).where(*eligible)
+    ).one()
+    main_group_counts = {
+        code: int(main_count_values[index] or 0)
+        for index, code in enumerate(_MAIN_INGREDIENT_GROUP_ALIASES)
+    }
+
+    category_items: dict[str, int] = defaultdict(int)
+    category_labels: dict[str, str] = {}
+    dish_group_counts = {code: 0 for code in _DISH_TYPE_GROUP_ALIASES}
+    if not large_catalog:
+        category_rows = list(
+            db.execute(
+                select(
+                    MenuCategoryModel.slug,
+                    func.min(MenuCategoryModel.id),
+                    MenuCategoryModel.name_en,
+                    MenuCategoryModel.name_ko,
+                    func.count(MenuItemModel.id),
+                )
+                .select_from(eligible_from)
+                .where(*eligible)
+                .group_by(
+                    MenuCategoryModel.slug,
+                    MenuCategoryModel.name_en,
+                    MenuCategoryModel.name_ko,
+                )
+            )
+        )
+        representative_category_ids = [str(row[1]) for row in category_rows]
+        representative_categories = {
+            category.id: category
+            for category in db.scalars(
+                select(MenuCategoryModel)
+                .where(MenuCategoryModel.id.in_(representative_category_ids))
+                .options(selectinload(MenuCategoryModel.translations))
+            )
+        }
+        for slug, category_id, name_en, name_ko, count in category_rows:
+            category = representative_categories[str(category_id)]
+            category_items[str(slug)] += int(count)
+            category_labels.setdefault(str(slug), _category_name(category, locale))
+            category_values = (
+                str(slug),
+                str(name_en),
+                str(name_ko or ""),
+                *(translation.name for translation in category.translations),
+            )
+            for code, aliases in _DISH_TYPE_GROUP_ALIASES.items():
+                if any(_contains_alias(value, aliases) for value in category_values):
+                    dish_group_counts[code] += int(count)
+
+    claim_from = (
+        MenuItemDietaryClaim.__table__.join(
+            MenuItemModel,
+            MenuItemModel.id == MenuItemDietaryClaim.menu_item_id,
+        )
+        .join(MenuCategoryModel, MenuCategoryModel.id == MenuItemModel.category_id)
+        .join(RestaurantModel, RestaurantModel.id == MenuItemModel.restaurant_id)
+    )
+    claim_items = {
+        str(code): int(count)
+        for code, count in db.execute(
+            select(
+                MenuItemDietaryClaim.code,
+                func.count(func.distinct(MenuItemModel.id)),
+            )
+            .select_from(claim_from)
+            .where(*eligible)
+            .group_by(MenuItemDietaryClaim.code)
+        )
+    }
+
+    dish_columns = (
+        []
+        if large_catalog
+        else [
+            func.sum(case((_sql_dish_type_predicate(code), 1), else_=0))
+            for code in _DISH_TYPE_GROUP_ALIASES
+        ]
+    )
+    price_columns = []
+    for minimum, maximum_exclusive in _PRICE_BUCKETS.values():
+        bucket = [MenuItemModel.price_amount.is_not(None)]
+        if minimum is not None:
+            bucket.append(MenuItemModel.price_amount >= minimum)
+        if maximum_exclusive is not None:
+            bucket.append(MenuItemModel.price_amount < maximum_exclusive)
+        price_columns.append(func.sum(case((and_(*bucket), 1), else_=0)))
+    if large_catalog:
+        core_counts = db.execute(
+            select(*price_columns).select_from(aggregate_from).where(*aggregate_eligible)
+        ).one()
+        prices = {code: int(core_counts[index] or 0) for index, code in enumerate(_PRICE_BUCKETS)}
+        curated_taste_counts = {code: 0 for code in _CURATED_TASTE_CODES}
+        solo_restaurant_count = 0
+    else:
+        core_counts = db.execute(
+            select(
+                *dish_columns,
+                *price_columns,
+                func.sum(case((MenuItemModel.spice_level == 0, 1), else_=0)),
+                func.sum(case((MenuItemModel.spice_level <= 1, 1), else_=0)),
+                func.count(
+                    func.distinct(case((_sql_solo_friendly_predicate(), RestaurantModel.id)))
+                ),
+            )
+            .select_from(aggregate_from)
+            .where(*aggregate_eligible)
+        ).one()
+        dish_group_counts = {
+            code: int(core_counts[index] or 0)
+            for index, code in enumerate(_DISH_TYPE_GROUP_ALIASES)
+        }
+        price_start = len(dish_columns)
+        prices = {
+            code: int(core_counts[price_start + index] or 0)
+            for index, code in enumerate(_PRICE_BUCKETS)
+        }
+        taste_start = price_start + len(_PRICE_BUCKETS)
+        curated_taste_counts = {
+            "not-spicy": int(core_counts[taste_start] or 0),
+            "mild": int(core_counts[taste_start + 1] or 0),
+        }
+        solo_restaurant_count = int(core_counts[taste_start + 2] or 0)
+
+    taste_items: dict[str, int] = defaultdict(int)
+    if not large_catalog:
+        profile_expression = cast(MenuItemModel.taste_profile, Text)
+        for raw_profile, count in db.execute(
+            select(profile_expression, func.count(MenuItemModel.id))
+            .select_from(eligible_from)
+            .where(*eligible)
+            .group_by(profile_expression)
+        ):
+            if not raw_profile:
+                continue
+            try:
+                profile = json.loads(raw_profile)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(profile, dict):
+                continue
+            for raw_code, raw_strength in profile.items():
+                if not isinstance(raw_strength, (int, float)) or raw_strength < 0.5:
+                    continue
+                code = str(raw_code)
+                taste_items[code] += int(count)
+                normalized_code = _fold(code).replace("_", "-").replace(" ", "-")
+                if normalized_code in {"rich", "light", "crispy"}:
+                    curated_taste_counts[normalized_code] = curated_taste_counts.get(
+                        normalized_code, 0
+                    ) + int(count)
+    for code in ("rich", "light", "crispy"):
+        curated_taste_counts.setdefault(code, 0)
+
+    if large_catalog:
+        open_restaurant_count = 0
+    else:
+        now = datetime.now(timezone.utc)
+        open_restaurant_count = int(
+            db.scalar(
+                select(func.count(RestaurantModel.id)).where(
+                    RestaurantModel.is_published.is_(True),
+                    _sql_open_now_predicate(db, now),
+                )
+            )
+            or 0
+        )
+    rating_restaurant_count = int(
+        db.scalar(
+            select(func.count(RestaurantModel.id)).where(
+                RestaurantModel.is_published.is_(True),
+                RestaurantModel.rating_avg >= 4.3,
+            )
+        )
+        or 0
+    )
 
     main_ingredient_labels = {
         "seafood": ("Seafood", "🦐"),
@@ -1432,7 +2406,7 @@ def search_facets(db: Session, *, locale: str) -> SearchFacets:
         SearchFacetOption(
             code=code,
             label=main_ingredient_labels[code][0],
-            count=len(main_group_items[code]),
+            count=main_group_counts[code],
             metadata={
                 "emoji": main_ingredient_labels[code][1],
                 "entity": "menu_item",
@@ -1446,16 +2420,14 @@ def search_facets(db: Session, *, locale: str) -> SearchFacets:
         SearchFacetOption(
             code=code,
             label=ingredient_labels[code][0],
-            count=len(item_ids),
+            count=count,
             metadata={
                 "emoji": ingredient_labels[code][1],
                 "entity": "menu_item",
                 "selection": "or",
             },
         )
-        for code, item_ids in sorted(
-            ingredient_items.items(), key=lambda pair: (-len(pair[1]), pair[0])
-        )
+        for code, count in sorted(ingredient_items.items(), key=lambda pair: (-pair[1], pair[0]))
         if code not in main_ingredient_labels
     ]
     ingredient_options = curated_ingredient_options + extra_ingredient_options
@@ -1470,8 +2442,20 @@ def search_facets(db: Session, *, locale: str) -> SearchFacets:
         SearchFacetOption(
             code=code,
             label=label,
-            count=len(dish_group_items[code]),
-            metadata={"entity": "menu_item", "selection": "or", "curated": True},
+            count=dish_group_counts[code],
+            metadata={
+                "entity": "menu_item",
+                "selection": "or",
+                "curated": True,
+                **(
+                    {
+                        "supported": False,
+                        "unavailable_reason": "dish_taxonomy_unavailable",
+                    }
+                    if large_catalog
+                    else {}
+                ),
+            },
         )
         for code, label in dish_group_labels.items()
     ]
@@ -1479,12 +2463,10 @@ def search_facets(db: Session, *, locale: str) -> SearchFacets:
         SearchFacetOption(
             code=code,
             label=category_labels[code],
-            count=len(item_ids),
+            count=count,
             metadata={"entity": "menu_item", "selection": "or"},
         )
-        for code, item_ids in sorted(
-            category_items.items(), key=lambda pair: (-len(pair[1]), pair[0])
-        )
+        for code, count in sorted(category_items.items(), key=lambda pair: (-pair[1], pair[0]))
         if code not in dish_group_labels
     ]
     category_options = curated_category_options + extra_category_options
@@ -1492,9 +2474,9 @@ def search_facets(db: Session, *, locale: str) -> SearchFacets:
         SearchFacetOption(
             code=code,
             label=code.replace("-", " ").title(),
-            count=len(item_ids),
+            count=count,
         )
-        for code, item_ids in sorted(claim_items.items())
+        for code, count in sorted(claim_items.items())
     ]
     price_labels = {
         "under-10000": "Under ₩10k",
@@ -1533,8 +2515,20 @@ def search_facets(db: Session, *, locale: str) -> SearchFacets:
         SearchFacetOption(
             code=code,
             label=label,
-            count=len(curated_taste_items[code]),
-            metadata={"entity": "menu_item", "selection": "or", "curated": True},
+            count=curated_taste_counts[code],
+            metadata={
+                "entity": "menu_item",
+                "selection": "or",
+                "curated": True,
+                **(
+                    {
+                        "supported": False,
+                        "unavailable_reason": "taste_profile_unavailable",
+                    }
+                    if large_catalog
+                    else {}
+                ),
+            },
         )
         for code, label in curated_taste_labels.items()
     ]
@@ -1542,10 +2536,10 @@ def search_facets(db: Session, *, locale: str) -> SearchFacets:
         SearchFacetOption(
             code=code,
             label=code.replace("-", " ").title(),
-            count=len(item_ids),
+            count=count,
             metadata={"entity": "menu_item", "selection": "or"},
         )
-        for code, item_ids in sorted(taste_items.items(), key=lambda pair: (-len(pair[1]), pair[0]))
+        for code, count in sorted(taste_items.items(), key=lambda pair: (-pair[1], pair[0]))
         if code not in curated_taste_labels
     ]
     taste_options = curated_taste_options + extra_taste_options
@@ -1553,8 +2547,18 @@ def search_facets(db: Session, *, locale: str) -> SearchFacets:
         SearchFacetOption(
             code="open-now",
             label="Open now",
-            count=sum(1 for restaurant in restaurants if restaurant_is_open(restaurant)),
-            metadata={"entity": "restaurant"},
+            count=open_restaurant_count,
+            metadata={
+                "entity": "restaurant",
+                **(
+                    {
+                        "supported": False,
+                        "unavailable_reason": "opening_hours_unavailable",
+                    }
+                    if large_catalog
+                    else {}
+                ),
+            },
         ),
         SearchFacetOption(
             code="10-min-walk",
@@ -1569,13 +2573,23 @@ def search_facets(db: Session, *, locale: str) -> SearchFacets:
         SearchFacetOption(
             code="solo-friendly",
             label="Solo-friendly",
-            count=len(solo_restaurant_ids),
-            metadata={"entity": "restaurant"},
+            count=solo_restaurant_count,
+            metadata={
+                "entity": "restaurant",
+                **(
+                    {
+                        "supported": False,
+                        "unavailable_reason": "serving_size_unavailable",
+                    }
+                    if large_catalog
+                    else {}
+                ),
+            },
         ),
         SearchFacetOption(
             code="rating-4.3-plus",
             label="4.3+ rating",
-            count=sum(1 for restaurant in restaurants if float(restaurant.rating_avg) >= 4.3),
+            count=rating_restaurant_count,
             metadata={"entity": "restaurant", "minimum": 4.3},
         ),
     ]
@@ -1605,19 +2619,31 @@ def trending_searches(db: Session, *, locale: str) -> TrendingSearches:
         ("samgyeopsal", 1_900, "Korean BBQ"),
         ("vegan-bibimbap", 1_200, "Vegan Bibimbap"),
     ]
+    curated_slugs = [slug for slug, _, _ in curated]
+    selected_items = (
+        select(
+            MenuItemModel.slug.label("slug"),
+            func.min(MenuItemModel.id).label("item_id"),
+        )
+        .join(RestaurantModel, RestaurantModel.id == MenuItemModel.restaurant_id)
+        .where(
+            MenuItemModel.slug.in_(curated_slugs),
+            MenuItemModel.is_available.is_(True),
+            RestaurantModel.is_published.is_(True),
+        )
+        .group_by(MenuItemModel.slug)
+        .subquery()
+    )
+    statement = (
+        select(MenuItemModel)
+        .join(selected_items, selected_items.c.item_id == MenuItemModel.id)
+        .options(selectinload(MenuItemModel.translations))
+    )
+    items_by_slug = {item.slug: item for item in db.scalars(statement)}
+
     items: list[TrendingSearch] = []
     for rank, (slug, search_count, english_query) in enumerate(curated, start=1):
-        statement = (
-            select(MenuItemModel)
-            .join(RestaurantModel, RestaurantModel.id == MenuItemModel.restaurant_id)
-            .where(
-                MenuItemModel.slug == slug,
-                MenuItemModel.is_available.is_(True),
-                RestaurantModel.is_published.is_(True),
-            )
-            .options(selectinload(MenuItemModel.translations))
-        )
-        item = db.scalars(statement).first()
+        item = items_by_slug.get(slug)
         if item is None:
             continue
         localized_name, _, _ = _item_text(item, locale)

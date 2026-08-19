@@ -72,8 +72,9 @@ Use `ap-northeast-2` and put EC2 in the same VPC as `fofu-postgres`.
    `/fofu/production/jwt-secret` as a Standard SecureString containing at least 32 random bytes.
    Generate it locally with `openssl rand -hex 32`; never paste it into Git or this repository.
 4. Launch an Arm-based Amazon Linux 2023 `t4g.micro` in a public subnet with the IAM role above.
-   Use a 12 GiB gp3 root disk and Session Manager instead of SSH. The Python and Caddy images used
-   here support Arm64.
+   Use an encrypted 12 GiB gp3 root disk and Session Manager instead of SSH. Require IMDSv2 and
+   set the metadata response hop limit to `1`, so application containers cannot obtain the EC2
+   instance role credentials. The Python and Caddy images used here support Arm64.
 5. The EC2 security group needs inbound TCP 80 and 443 from the internet and no port 22 rule. Add
    UDP 443 if HTTP/3 is desired. The RDS security group must allow PostgreSQL TCP 5432 **from this
    EC2 security group only**, never from `0.0.0.0/0`.
@@ -88,12 +89,14 @@ In an EC2 Session Manager shell:
 sudo dnf install -y docker git
 sudo systemctl enable --now docker
 aws --version
-docker compose version
+sudo docker compose version
 ```
 
-The last command must report Docker Compose v2.20 or newer. If the plugin is absent, install the
-current Compose plugin using Docker's official Linux installation instructions; do not install the
-legacy Python `docker-compose` command.
+The last command must report Docker Compose v2.20 or newer. Amazon Linux may not install the
+Compose plugin with Docker Engine. If it is absent, install a version-pinned ARM64 plugin into the
+system-wide `/usr/local/lib/docker/cli-plugins/docker-compose` path, verify its published checksum,
+and rerun `sudo docker compose version`. Follow Docker's official Linux plugin instructions; do not
+install the legacy Python `docker-compose` command or put the plugin only in one user's home.
 
 The micro instance has 1 GiB RAM. Add a 2 GiB swap file once so the first local Docker build does
 not run out of memory:
@@ -129,6 +132,9 @@ Replace every `example.com` value. `FOFU_DOMAIN` is only the hostname, while the
 URL/origin values include `https://`. Configure the real Google OAuth audience before enabling
 Google login. Leave schema creation, demo seed, and APNs disabled for the first deployment.
 
+The startup wrapper rejects `example.com` placeholders and a PostgreSQL URL that does not contain
+`sslmode=require`, `sslmode=verify-ca`, or `sslmode=verify-full`.
+
 Do not put either secret in this file. The app role in the RDS URL should be `fofu_app`, not the RDS
 master user. URL-encode special characters in the database password.
 
@@ -154,6 +160,10 @@ curl --fail --show-error https://api.example.com/health/ready
 The final response must contain `"status":"ready"`. Also verify that plain HTTP redirects to
 HTTPS and that `https://api.example.com/api/v1/docs` loads.
 
+Docker restarts containers that exit and systemd retries a failed initial deployment. Neither one
+restarts a process merely because its health check becomes unhealthy, so configure an external
+HTTPS uptime check for `/health/ready` and an alert before relying on this service remotely.
+
 Confirm the proxy health listener is bound to container loopback and not the Docker interfaces:
 
 ```bash
@@ -176,6 +186,11 @@ cd /opt/fofu
 sudo ./deploy/aws/compose-with-ssm.sh logs --tail 200 api
 sudo ./deploy/aws/compose-with-ssm.sh logs --tail 200 proxy
 ```
+
+The wrapper loads decrypted SSM values only for `up`, `create`, and `run`. Read-only operational
+commands and `down` use interpolation placeholders, so they remain available during an SSM outage.
+It refuses the output-producing `docker compose config` form because that output could disclose
+secrets; only `config --quiet` is allowed.
 
 Deploy a fast-forward Git update:
 

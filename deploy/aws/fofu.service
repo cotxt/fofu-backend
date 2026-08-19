@@ -10,6 +10,8 @@ StartLimitBurst=3
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+Restart=on-failure
+RestartSec=15s
 WorkingDirectory=/opt/fofu
 Environment=AWS_REGION=ap-northeast-2
 Environment=FOFU_CONFIG_FILE=/etc/fofu/production.env

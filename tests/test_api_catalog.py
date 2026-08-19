@@ -404,6 +404,102 @@ def test_search_facets_are_curated_ordered_and_counted(client: TestClient) -> No
     assert conditions["rating-4.3-plus"]["count"] == 4
 
 
+def test_search_and_facets_never_load_the_full_catalog_graph(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_full_catalog_load(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("search endpoints must aggregate and page in SQL")
+
+    monkeypatch.setattr(catalog_service, "_load_restaurants", fail_full_catalog_load)
+
+    search = client.get(
+        f"{API_V1}/search",
+        params={
+            "q": "kimchi",
+            "lat": 37.5563,
+            "lng": 126.9236,
+            "radius_m": 5_000,
+            "limit": 1,
+        },
+    )
+    assert search.status_code == 200, search.text
+    body = search.json()
+    assert len(body["items"]) == 1
+    assert len(body["restaurants"]) <= 1
+    assert body["item_count"] >= 1
+
+    facets = client.get(f"{API_V1}/search/facets", params={"locale": "en"})
+    assert facets.status_code == 200, facets.text
+    assert facets.json()["sections"]
+
+    nearby = client.get(
+        f"{API_V1}/restaurants",
+        params={"price": "10000-20000", "limit": 1},
+    )
+    assert nearby.status_code == 200, nearby.text
+    assert len(nearby.json()["items"]) == 1
+
+
+def test_large_catalog_fast_path_is_bounded_and_marks_missing_facets_unsupported(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(catalog_service, "_catalog_is_large", lambda _db: True)
+
+    def fail_full_catalog_load(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("large-catalog endpoints must not hydrate the full graph")
+
+    monkeypatch.setattr(catalog_service, "_load_restaurants", fail_full_catalog_load)
+
+    search = client.get(
+        f"{API_V1}/search",
+        params={
+            "q": "kimchi",
+            "lat": 37.5563,
+            "lng": 126.9236,
+            "radius_m": 5_000,
+            "limit": 1,
+        },
+    )
+    assert search.status_code == 200, search.text
+    assert len(search.json()["items"]) == 1
+
+    unbounded_search = client.get(
+        f"{API_V1}/search",
+        params={"q": "kimchi", "limit": 1},
+    )
+    assert unbounded_search.status_code == 422
+    assert unbounded_search.json()["error"]["code"] == "search_area_required"
+
+    facets = client.get(f"{API_V1}/search/facets", params={"locale": "en"})
+    assert facets.status_code == 200, facets.text
+    sections = {section["key"]: section for section in facets.json()["sections"]}
+    for key in ("dish_types", "taste"):
+        assert all(option["count"] == 0 for option in sections[key]["options"])
+        assert all(option["metadata"]["supported"] is False for option in sections[key]["options"])
+    conditions = {option["code"]: option for option in sections["conditions"]["options"]}
+    assert conditions["open-now"]["metadata"]["supported"] is False
+    assert conditions["solo-friendly"]["metadata"]["supported"] is False
+
+    unsupported_taste = client.get(
+        f"{API_V1}/restaurants",
+        params={"taste": "mild", "limit": 1},
+    )
+    assert unsupported_taste.status_code == 200, unsupported_taste.text
+    assert unsupported_taste.json()["total"] == 0
+
+    for unsupported_filter in (
+        {"spicy": "false"},
+        {"solo_friendly": "true"},
+        {"exclude_allergen": "pork"},
+    ):
+        response = client.get(
+            f"{API_V1}/restaurants",
+            params={**unsupported_filter, "limit": 1},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["total"] == 0
+
+
 def test_unfiltered_nearby_pages_before_loading_catalog_relationships(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

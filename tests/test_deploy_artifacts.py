@@ -12,6 +12,8 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_PATH = ROOT / "deploy" / "aws" / "compose.production.yaml"
 CADDYFILE_PATH = ROOT / "deploy" / "aws" / "Caddyfile"
+WRAPPER_PATH = ROOT / "deploy" / "aws" / "compose-with-ssm.sh"
+UNIT_PATH = ROOT / "deploy" / "aws" / "fofu.service"
 
 
 def load_compose() -> dict[str, Any]:
@@ -26,9 +28,7 @@ def test_production_proxy_network_and_trusted_ip_stay_aligned() -> None:
 
     assert "ports" not in api
     assert networks["proxy-internal"]["internal"] is True
-    assert networks["proxy-internal"]["ipam"]["config"] == [
-        {"subnet": "172.30.0.0/24"}
-    ]
+    assert networks["proxy-internal"]["ipam"]["config"] == [{"subnet": "172.30.0.0/24"}]
     assert api["networks"]["proxy-internal"]["ipv4_address"] == "172.30.0.3"
     assert proxy["networks"]["proxy-internal"]["ipv4_address"] == "172.30.0.2"
     assert set(api["networks"]) & set(proxy["networks"]) == {"proxy-internal"}
@@ -52,6 +52,24 @@ def test_caddy_access_log_cannot_capture_revocable_qr_paths() -> None:
     # Caddy sees the raw URL before the application's Uvicorn redaction filter.
     # Keep access logging off until a tested path-redaction encoder is configured.
     assert "\n\tlog {" not in caddyfile
+
+
+def test_runtime_wrapper_enforces_safe_secret_handling() -> None:
+    wrapper = WRAPPER_PATH.read_text()
+
+    assert "up | create | run)" in wrapper
+    assert "refusing to render Compose configuration" in wrapper
+    assert "replace every example.com placeholder" in wrapper
+    assert "sslmode=require" in wrapper
+    assert "sslmode=verify-full" in wrapper
+    assert "for attempt in 1 2 3 4 5" in wrapper
+
+
+def test_systemd_retries_a_failed_initial_start() -> None:
+    unit = UNIT_PATH.read_text()
+
+    assert "Restart=on-failure" in unit
+    assert "RestartSec=15s" in unit
 
 
 async def proxy_scope(client_ip: str) -> dict[str, Any]:
