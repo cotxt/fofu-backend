@@ -39,8 +39,11 @@ if [[ ! "${DATA_VOLUME_ID}" =~ ^vol-[0-9a-f]+$ ]]; then
   exit 64
 fi
 
-dnf upgrade -y
-dnf install -y curl docker git util-linux xfsprogs
+# Amazon Linux 2023 ships curl-minimal, which provides the curl command but
+# conflicts with the full curl package. --allowerasing lets dnf swap it for
+# full curl instead of aborting the whole transaction on that conflict.
+dnf upgrade -y --allowerasing
+dnf install -y --allowerasing curl docker git util-linux xfsprogs
 
 systemctl enable --now amazon-ssm-agent
 systemctl enable --now docker
