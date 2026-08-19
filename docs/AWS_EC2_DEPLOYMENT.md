@@ -26,6 +26,27 @@ causes downtime. RDS backups are still required.
 
 Use `ap-northeast-2` and put EC2 in the same VPC as `fofu-postgres`.
 
+The recommended first step is the idempotent CloudShell helper. It validates that the existing
+RDS instance is available and private, verifies the database URL parameter without printing its
+value, and prepares only the JWT Standard SecureString, least-privilege EC2 role, and instance
+profile. It does not create a metered compute, public IPv4, or networking resource. Standard
+parameters have no parameter-storage charge; normal API/KMS request pricing and quotas still
+apply:
+
+```bash
+export AWS_REGION=ap-northeast-2
+git clone https://github.com/cotxt/fofu-backend.git
+cd fofu-backend
+bash deploy/aws/prepare-runtime-identity.sh check
+bash deploy/aws/prepare-runtime-identity.sh apply
+```
+
+If the repository already exists in CloudShell, enter it and run `git pull --ff-only` instead of
+cloning it again. The helper never decrypts or overwrites an existing JWT parameter. Review the
+manual equivalent below when auditing or creating these resources in the console. If AWS CLI
+history is enabled, `apply` stops before changing IAM or generating a secret; disable history with
+`aws configure set cli_history disabled` and rerun it.
+
 1. Create an EC2 IAM role, for example `fofu-api-ec2-role`, with EC2 as its trusted service.
 2. For strict Parameter Store isolation, do **not** attach `AmazonSSMManagedInstanceCore`. Its
    current v2 policy grants both `ssm:GetParameter` and `ssm:GetParameters` on `Resource: "*"`, and
