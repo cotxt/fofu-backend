@@ -241,9 +241,15 @@ curl --fail --show-error --silent --get \
 curl --fail --show-error --silent --get \
   'https://api.fofu.me/api/v1/search' \
   --data-urlencode 'q=김치' \
+  --data 'lat=33.4996' \
+  --data 'lng=126.5312' \
+  --data 'radius_m=50000' \
   --data 'limit=1' \
   | jq '{query,item_count,restaurant_count}'
 ```
+
+The production catalog bounds search to an explicit area, so `lat`, `lng`, and
+`radius_m` are required; omitting them returns `422 search_area_required`.
 
 The readiness response must contain `"status":"ready"`, plain HTTP must redirect to HTTPS, and
 the Jeju restaurant request must return a nonzero `total`. Also open
